@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Audio Dynamics",
+  "version": "1.0.0",
+  "description": "Compressor + real-time -0.1 dBFS peak normalizer with automatic Music/VEVO bypass inside the YouTube player.",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["page-bridge.js"],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "world": "ISOLATED",
+      "run_at": "document_idle"
+    }
+  ]
+}

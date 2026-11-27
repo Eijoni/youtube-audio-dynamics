@@ -1,0 +1,235 @@
+/* Player bar icon button */
+.yt-ac-btn {
+  position: relative;
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.9;
+  transition: opacity 0.15s ease;
+}
+
+.yt-ac-btn:hover {
+  opacity: 1;
+}
+
+.yt-ac-btn svg {
+  width: 24px;
+  height: 24px;
+  pointer-events: none;
+}
+
+/* Visual state colors on the icon */
+.yt-ac-btn[data-state="active"] .yt-ac-bars {
+  fill: #3ddc84;
+}
+
+.yt-ac-btn[data-state="music-bypass"] .yt-ac-bars {
+  fill: #f5b041;
+}
+
+.yt-ac-btn[data-state="off"] .yt-ac-bars {
+  fill: #aaaaaa;
+  opacity: 0.65;
+}
+
+.yt-ac-btn .yt-ac-dot {
+  transition: opacity 0.15s ease, fill 0.15s ease;
+}
+
+.yt-ac-btn[data-state="active"] .yt-ac-dot {
+  fill: #3ddc84;
+  opacity: 1;
+}
+
+.yt-ac-btn[data-state="music-bypass"] .yt-ac-dot {
+  fill: #f5b041;
+  opacity: 1;
+}
+
+.yt-ac-btn[data-state="off"] .yt-ac-dot {
+  opacity: 0;
+}
+
+/* Sub-menu inside the player window */
+.yt-ac-panel {
+  position: absolute;
+  right: 12px;
+  bottom: 58px;
+  width: 295px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(20, 20, 20, 0.93);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+  color: #f1f1f1;
+  font-family: "Roboto", "Arial", sans-serif;
+  font-size: 12px;
+  line-height: 1.4;
+  z-index: 2050;
+  user-select: none;
+  display: none;
+  box-sizing: border-box;
+}
+
+.yt-ac-panel.open {
+  display: block;
+}
+
+.yt-ac-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.yt-ac-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.yt-ac-status {
+  font-size: 11px;
+  margin-bottom: 10px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #ccc;
+}
+
+.yt-ac-status[data-state="active"] {
+  color: #3ddc84;
+  background: rgba(61, 220, 132, 0.12);
+}
+
+.yt-ac-status[data-state="music-bypass"] {
+  color: #f5b041;
+  background: rgba(245, 176, 65, 0.14);
+}
+
+/* Master switch */
+.yt-ac-toggle {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  border: none;
+  background: #555;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s ease;
+}
+
+.yt-ac-toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s ease;
+}
+
+.yt-ac-toggle[aria-checked="true"] {
+  background: #3ddc84;
+}
+
+.yt-ac-toggle[aria-checked="true"]::after {
+  transform: translateX(16px);
+}
+
+/* Preset buttons */
+.yt-ac-presets {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.yt-ac-preset-btn {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ddd;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 5px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.yt-ac-preset-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.yt-ac-preset-btn.selected {
+  background: rgba(61, 220, 132, 0.2);
+  border-color: #3ddc84;
+  color: #fff;
+}
+
+/* Sliders */
+.yt-ac-sliders {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.yt-ac-slider-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.yt-ac-slider-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #ccc;
+}
+
+.yt-ac-slider-val {
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  font-weight: 500;
+}
+
+.yt-ac-slider {
+  width: 100%;
+  height: 4px;
+  accent-color: #3ddc84;
+  cursor: pointer;
+  margin: 2px 0;
+}
+
+/* Checkbox & telemetry */
+.yt-ac-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  font-size: 11px;
+  color: #ddd;
+  cursor: pointer;
+}
+
+.yt-ac-option input {
+  accent-color: #3ddc84;
+  cursor: pointer;
+}
+
+.yt-ac-meter {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  justify-content: space-between;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: #9e9e9e;
+}
