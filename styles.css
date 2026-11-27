@@ -1,11 +1,11 @@
-/* Player bar icon button */
+/* Player bar icon button (Watch) */
 .yt-ac-btn {
   position: relative;
   display: inline-flex !important;
   align-items: center;
   justify-content: center;
   opacity: 0.9;
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, background 0.15s ease;
 }
 
 .yt-ac-btn:hover {
@@ -16,6 +16,32 @@
   width: 24px;
   height: 24px;
   pointer-events: none;
+}
+
+/* Floating circular player button (Shorts) */
+.yt-ac-btn-shorts {
+  position: absolute !important;
+  top: 60px;
+  right: 12px;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(15, 15, 15, 0.65);
+  backdrop-filter: blur(8px);
+  cursor: pointer;
+  z-index: 2040;
+  pointer-events: auto !important;
+}
+
+.yt-ac-btn-shorts:hover {
+  background: rgba(30, 30, 30, 0.88);
+}
+
+.yt-ac-btn-shorts svg {
+  width: 22px;
+  height: 22px;
 }
 
 /* Visual state colors on the icon */
@@ -50,7 +76,7 @@
   opacity: 0;
 }
 
-/* Sub-menu inside the player window */
+/* Sub-menu inside the player window (Watch) */
 .yt-ac-panel {
   position: absolute;
   right: 12px;
@@ -70,6 +96,15 @@
   user-select: none;
   display: none;
   box-sizing: border-box;
+  pointer-events: auto !important;
+}
+
+/* Sub-menu positioning inside vertical Shorts player */
+.yt-ac-panel.yt-ac-panel-shorts {
+  top: 108px;
+  right: 12px;
+  bottom: auto;
+  width: min(295px, calc(100% - 24px));
 }
 
 .yt-ac-panel.open {

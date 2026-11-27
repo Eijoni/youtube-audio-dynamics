@@ -40,13 +40,16 @@
   let currentMeta = { videoId: '', title: '', author: '', shortDescription: '', category: '' };
   let musicReason = null;      // null if not music, otherwise string reason
   let manualOverrideId = null; // lets you force-enable on a specific video ID
+  let lastHref = location.href;
 
-  // Web Audio state
-  let hookedVideo = null;
+  // Web Audio state (shared graph across Watch and Shorts video elements)
+  let activeVideo = null;
   let audioCtx = null;
   let nodes = null;
   let inAnalyserBuf = null;
   let normAnalyserBuf = null;
+  const videoSources = new WeakMap();
+  const boundVideos = new WeakSet();
 
   // Dynamic threshold trackers (pre-compressor input)
   let trackedInRms = 0.1;        // ~ -20 dBFS starting guess
@@ -63,8 +66,13 @@
 
   // UI refs
   let ui = null;
+  let mountedMode = null; // 'watch' | 'shorts' | null
 
   // ---------- Helpers ----------
+  function isShortsPage() {
+    return location.pathname.startsWith('/shorts/');
+  }
+
   function el(tag, attrs = {}, children = []) {
     const node = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs)) {
@@ -169,12 +177,16 @@
     return curve;
   }
 
-  function hookVideo(video) {
-    if (!video || video === hookedVideo) return;
-    hookedVideo = video;
+  function resumeCtx() {
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+    }
+  }
+
+  function ensureAudioGraph() {
+    if (nodes && audioCtx) return;
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const source = audioCtx.createMediaElementSource(video);
 
     // Dry path (untouched bypass)
     const dryGain = audioCtx.createGain();
@@ -214,12 +226,8 @@
     const postVolGain = audioCtx.createGain();
     const wetGain = audioCtx.createGain();
 
-    // Wire dry path
-    source.connect(dryGain);
     dryGain.connect(audioCtx.destination);
 
-    // Wire wet path
-    source.connect(preVolGain);
     preVolGain.connect(inAnalyser);
     inAnalyser.connect(compressor);
     compressor.connect(normAnalyser);
@@ -231,7 +239,6 @@
     wetGain.connect(audioCtx.destination);
 
     nodes = {
-      source,
       dryGain,
       preVolGain,
       inAnalyser,
@@ -244,25 +251,63 @@
       wetGain
     };
 
-    const resumeCtx = () => {
-      if (audioCtx && audioCtx.state === 'suspended') {
-        audioCtx.resume().catch(() => {});
-      }
-    };
-
-    video.addEventListener('play', resumeCtx);
-    video.addEventListener('volumechange', syncVolumeCompensation);
     document.addEventListener('pointerdown', resumeCtx, { passive: true });
-
-    applyAudioSettings();
-    syncVolumeCompensation();
     startDspLoop();
   }
 
+  function hookVideo(video) {
+    if (!video || video === activeVideo) return;
+    ensureAudioGraph();
+
+    // Detach previous video element from the shared DSP graph when switching Watch <-> Shorts
+    if (activeVideo && videoSources.has(activeVideo)) {
+      const prevSrc = videoSources.get(activeVideo);
+      try {
+        prevSrc.disconnect(nodes.dryGain);
+        prevSrc.disconnect(nodes.preVolGain);
+      } catch (_) {}
+    }
+
+    let source = videoSources.get(video);
+    if (!source) {
+      source = audioCtx.createMediaElementSource(video);
+      videoSources.set(video, source);
+    }
+
+    source.connect(nodes.dryGain);
+    source.connect(nodes.preVolGain);
+    activeVideo = video;
+
+    if (!boundVideos.has(video)) {
+      boundVideos.add(video);
+
+      video.addEventListener('play', () => {
+        if (video !== activeVideo) return;
+        resumeCtx();
+        syncVolumeCompensation();
+        window.dispatchEvent(new Event('yt-ac-request-meta'));
+      });
+
+      video.addEventListener('volumechange', () => {
+        if (video === activeVideo) syncVolumeCompensation();
+      });
+
+      video.addEventListener('loadedmetadata', () => {
+        if (video !== activeVideo) return;
+        syncVolumeCompensation();
+        window.dispatchEvent(new Event('yt-ac-request-meta'));
+      });
+    }
+
+    resetDynamicsState();
+    applyAudioSettings();
+    syncVolumeCompensation();
+  }
+
   function syncVolumeCompensation() {
-    if (!nodes || !audioCtx || !hookedVideo) return;
+    if (!nodes || !audioCtx || !activeVideo) return;
     const now = audioCtx.currentTime;
-    const v = hookedVideo.muted ? 0 : hookedVideo.volume;
+    const v = activeVideo.muted ? 0 : activeVideo.volume;
 
     if (v < 0.01) {
       nodes.preVolGain.gain.setTargetAtTime(1.0, now, 0.01);
@@ -309,19 +354,29 @@
     }
   }
 
+  function checkUrlChange() {
+    if (location.href !== lastHref) {
+      lastHref = location.href;
+      tryAttach();
+      window.dispatchEvent(new Event('yt-ac-request-meta'));
+    }
+  }
+
   function startDspLoop() {
     if (dspIntervalId) clearInterval(dspIntervalId);
     lastLoopTick = performance.now();
 
     dspIntervalId = setInterval(() => {
+      checkUrlChange();
+
       const nowMs = performance.now();
       const dt = Math.min((nowMs - lastLoopTick) / 1000, 0.25);
       lastLoopTick = nowMs;
 
-      if (!nodes || !audioCtx || !hookedVideo) return;
+      if (!nodes || !audioCtx || !activeVideo) return;
 
       const active = isEffectivelyActive();
-      const playing = !hookedVideo.paused && !hookedVideo.ended && !hookedVideo.muted && hookedVideo.volume >= 0.01;
+      const playing = !activeVideo.paused && !activeVideo.ended && !activeVideo.muted && activeVideo.volume >= 0.01;
       const p = getActiveParams();
 
       if (active && playing && audioCtx.state === 'running') {
@@ -463,14 +518,12 @@
     };
   }
 
-  function mountUI() {
-    const player = document.getElementById('movie_player');
-    const rightControls = player?.querySelector('.ytp-right-controls');
-    if (!player || !rightControls) return;
-    if (document.getElementById('yt-ac-btn')) return;
+  function createUIOnce() {
+    if (ui) return;
 
     const btn = el('button', {
       id: 'yt-ac-btn',
+      type: 'button',
       className: 'ytp-button yt-ac-btn',
       title: 'Audio Dynamics (Compressor + -0.1 dB Normalizer)',
       'aria-label': 'Audio Dynamics',
@@ -482,14 +535,15 @@
       }
     }, [buildIconSvg()]);
 
-    // Insert cleanly right next to the Settings gear
-    const settingsBtn = rightControls.querySelector('.ytp-settings-button');
-    if (settingsBtn) settingsBtn.before(btn);
-    else rightControls.prepend(btn);
+    // Prevent Shorts click-to-pause from firing when interacting with the button
+    for (const evt of ['pointerdown', 'mousedown', 'mouseup', 'dblclick']) {
+      btn.addEventListener(evt, (e) => e.stopPropagation());
+    }
 
     const statusBar = el('div', { className: 'yt-ac-status' });
 
     const masterToggle = el('button', {
+      type: 'button',
       className: 'yt-ac-toggle',
       role: 'switch',
       'aria-checked': 'true',
@@ -513,6 +567,7 @@
       ['custom', 'Custom']
     ].map(([key, label]) => {
       const b = el('button', {
+        type: 'button',
         className: 'yt-ac-preset-btn',
         textContent: label,
         onClick: () => {
@@ -605,12 +660,10 @@
       el('div', { className: 'yt-ac-meter' }, [meterThr, meterGr, meterNorm])
     ]);
 
-    // Prevent clicks/keys inside the sub-menu from triggering YouTube hotkeys
-    for (const evt of ['click', 'mousedown', 'keydown', 'keyup']) {
+    // Prevent clicks, keys, and wheel scrolls inside the sub-menu from affecting YouTube or Shorts
+    for (const evt of ['pointerdown', 'mousedown', 'mouseup', 'click', 'dblclick', 'keydown', 'keyup', 'wheel']) {
       panel.addEventListener(evt, (e) => e.stopPropagation());
     }
-
-    player.appendChild(panel);
 
     ui = {
       btn,
@@ -625,8 +678,58 @@
       meterGr,
       meterNorm
     };
+  }
 
-    syncUI();
+  function mountUI() {
+    const shorts = isShortsPage();
+
+    if (shorts) {
+      const shortsPlayer = document.getElementById('shorts-player');
+      if (!shortsPlayer) return;
+      createUIOnce();
+
+      const needsMount =
+        mountedMode !== 'shorts' ||
+        !shortsPlayer.contains(ui.btn) ||
+        !shortsPlayer.contains(ui.panel);
+
+      if (needsMount) {
+        const keepOpen = mountedMode === 'shorts' && ui.panel.classList.contains('open');
+        ui.btn.className = 'yt-ac-btn yt-ac-btn-shorts';
+        ui.panel.className = keepOpen
+          ? 'yt-ac-panel yt-ac-panel-shorts open'
+          : 'yt-ac-panel yt-ac-panel-shorts';
+        shortsPlayer.appendChild(ui.btn);
+        shortsPlayer.appendChild(ui.panel);
+        mountedMode = 'shorts';
+        syncUI();
+      }
+      return;
+    }
+
+    const player = document.getElementById('movie_player');
+    const rightControls = player?.querySelector('.ytp-right-controls');
+    if (!player || !rightControls) return;
+    createUIOnce();
+
+    const needsMount =
+      mountedMode !== 'watch' ||
+      !rightControls.contains(ui.btn) ||
+      !player.contains(ui.panel);
+
+    if (needsMount) {
+      const keepOpen = mountedMode === 'watch' && ui.panel.classList.contains('open');
+      ui.btn.className = 'ytp-button yt-ac-btn';
+      ui.panel.className = keepOpen ? 'yt-ac-panel open' : 'yt-ac-panel';
+
+      const settingsBtn = rightControls.querySelector('.ytp-settings-button');
+      if (settingsBtn) settingsBtn.before(ui.btn);
+      else rightControls.prepend(ui.btn);
+
+      player.appendChild(ui.panel);
+      mountedMode = 'watch';
+      syncUI();
+    }
   }
 
   function syncUI() {
@@ -699,9 +802,9 @@
   // ---------- Metadata & SPA Lifecycle ----------
   window.addEventListener('yt-ac-meta', (e) => {
     const nextMeta = e.detail || {};
-    const changedVideo = nextMeta.videoId && nextMeta.videoId !== currentMeta.videoId;
+    const changedVideo = Boolean(nextMeta.videoId && nextMeta.videoId !== currentMeta.videoId);
     currentMeta = nextMeta;
-    musicReason = detectMusicReason(currentMeta);
+    musicReason = nextMeta.pending ? null : detectMusicReason(currentMeta);
 
     if (changedVideo) {
       manualOverrideId = null;
@@ -712,19 +815,36 @@
     syncUI();
   });
 
+  function getTargetVideo() {
+    if (isShortsPage()) {
+      return (
+        document.querySelector('#shorts-player video.html5-main-video') ||
+        document.querySelector('ytd-reel-video-renderer[is-active] video')
+      );
+    }
+    return document.querySelector('#movie_player video.html5-main-video');
+  }
+
   function tryAttach() {
-    const video = document.querySelector('#movie_player video.html5-main-video');
+    const video = getTargetVideo();
     if (video) hookVideo(video);
     mountUI();
   }
 
   const observer = new MutationObserver(() => {
+    checkUrlChange();
     tryAttach();
   });
 
   observer.observe(document.documentElement, { childList: true, subtree: true });
 
   window.addEventListener('yt-navigate-finish', () => {
+    lastHref = location.href;
+    tryAttach();
+    window.dispatchEvent(new Event('yt-ac-request-meta'));
+  });
+
+  window.addEventListener('yt-page-data-updated', () => {
     tryAttach();
     window.dispatchEvent(new Event('yt-ac-request-meta'));
   });
