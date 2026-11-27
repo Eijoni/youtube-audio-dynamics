@@ -3,30 +3,35 @@
 
   const TARGET_PEAK_DB = -0.1;
   const TARGET_PEAK_LINEAR = Math.pow(10, TARGET_PEAK_DB / 20); // 0.988553
-  const NOISE_FLOOR_LINEAR = 0.005; // ~ -46 dBFS gate so silence doesn't boost hiss
+  const NOISE_FLOOR_LINEAR = 0.005; // ~ -46 dBFS gate so silence doesn't drift threshold or boost hiss
   const MIN_NORM_GAIN = 0.25;       // -12 dB max attenuation
   const MAX_NORM_GAIN = 16.0;       // +24 dB max boost
 
   const PRESETS = {
     balanced: {
-      threshold: -24,
+      threshold: -24,  // Used when Dynamic Threshold is OFF
+      headroom: 4,     // Used when Dynamic Threshold is ON (dB above avg input RMS)
+      relaxCrest: 11,  // Back off threshold if video crest factor is below 11 dB
       ratio: 4,
       knee: 12,
-      attack: 0.010,  // 10 ms
-      release: 0.250  // 250 ms
+      attack: 0.010,   // 10 ms
+      release: 0.250   // 250 ms
     },
     night: {
       threshold: -36,
+      headroom: -2,
+      relaxCrest: 7,
       ratio: 10,
       knee: 8,
-      attack: 0.003,  // 3 ms
-      release: 0.200  // 200 ms
+      attack: 0.003,   // 3 ms
+      release: 0.200   // 200 ms
     }
   };
 
   const DEFAULT_SETTINGS = {
     enabled: true,
     autoBypassMusic: true,
+    dynamicThreshold: true,
     preset: 'balanced',
     custom: { ...PRESETS.balanced }
   };
@@ -40,11 +45,21 @@
   let hookedVideo = null;
   let audioCtx = null;
   let nodes = null;
-  let analyserBuf = null;
-  let trackedPeak = 0.25;
+  let inAnalyserBuf = null;
+  let normAnalyserBuf = null;
+
+  // Dynamic threshold trackers (pre-compressor input)
+  let trackedInRms = 0.1;        // ~ -20 dBFS starting guess
+  let trackedInPeak = 0.25;      // ~ -12 dBFS starting guess
+  let trackedSpeechSec = 0;      // Fast convergence during first 2s of each video
+  let currentDynThreshold = -16; // Live smoothed threshold in dB
+
+  // Normalizer trackers (post-compressor output)
+  let trackedNormPeak = 0.25;
   let currentNormGain = 1.0;
-  let lastNormTick = performance.now();
-  let normIntervalId = null;
+
+  let lastLoopTick = performance.now();
+  let dspIntervalId = null;
 
   // UI refs
   let ui = null;
@@ -110,6 +125,7 @@
           settings = {
             enabled: typeof saved.enabled === 'boolean' ? saved.enabled : DEFAULT_SETTINGS.enabled,
             autoBypassMusic: typeof saved.autoBypassMusic === 'boolean' ? saved.autoBypassMusic : DEFAULT_SETTINGS.autoBypassMusic,
+            dynamicThreshold: typeof saved.dynamicThreshold === 'boolean' ? saved.dynamicThreshold : DEFAULT_SETTINGS.dynamicThreshold,
             preset: ['balanced', 'night', 'custom'].includes(saved.preset) ? saved.preset : 'balanced',
             custom: { ...PRESETS.balanced, ...(saved.custom || {}) }
           };
@@ -164,20 +180,25 @@
     const dryGain = audioCtx.createGain();
 
     // Wet path:
-    // 1. Undo video.volume so compressor & normalizer always work at full scale
+    // 1. Undo video.volume so input analyser, compressor & normalizer always work at full scale
     const preVolGain = audioCtx.createGain();
 
-    // 2. Stage 1: Configurable Dynamics Compressor (no makeup gain control)
+    // 2. Pre-compressor analyser for RMS + Crest Factor dynamic threshold
+    const inAnalyser = audioCtx.createAnalyser();
+    inAnalyser.fftSize = 2048;
+    inAnalyserBuf = new Float32Array(inAnalyser.fftSize);
+
+    // 3. Stage 1: Configurable Dynamics Compressor (no makeup gain control)
     const compressor = audioCtx.createDynamicsCompressor();
 
-    // 3. Stage 2: Post-compressor peak analyser + adaptive normalizer gain
+    // 4. Stage 2: Post-compressor peak analyser + adaptive normalizer gain
     const normAnalyser = audioCtx.createAnalyser();
     normAnalyser.fftSize = 2048;
-    analyserBuf = new Float32Array(normAnalyser.fftSize);
+    normAnalyserBuf = new Float32Array(normAnalyser.fftSize);
 
     const normGain = audioCtx.createGain();
 
-    // 4. Brickwall safety limiter + strict -0.1 dBFS ceiling
+    // 5. Brickwall safety limiter + strict -0.1 dBFS ceiling
     const safetyLimiter = audioCtx.createDynamicsCompressor();
     safetyLimiter.threshold.value = -0.5;
     safetyLimiter.knee.value = 0;
@@ -189,7 +210,7 @@
     hardCeiling.curve = createHardCeilingCurve(TARGET_PEAK_LINEAR);
     hardCeiling.oversample = 'none';
 
-    // 5. Re-apply YouTube's native volume slider + wet crossfade
+    // 6. Re-apply YouTube's native volume slider + wet crossfade
     const postVolGain = audioCtx.createGain();
     const wetGain = audioCtx.createGain();
 
@@ -199,7 +220,8 @@
 
     // Wire wet path
     source.connect(preVolGain);
-    preVolGain.connect(compressor);
+    preVolGain.connect(inAnalyser);
+    inAnalyser.connect(compressor);
     compressor.connect(normAnalyser);
     normAnalyser.connect(normGain);
     normGain.connect(safetyLimiter);
@@ -212,6 +234,7 @@
       source,
       dryGain,
       preVolGain,
+      inAnalyser,
       compressor,
       normAnalyser,
       normGain,
@@ -233,7 +256,7 @@
 
     applyAudioSettings();
     syncVolumeCompensation();
-    startNormalizerLoop();
+    startDspLoop();
   }
 
   function syncVolumeCompensation() {
@@ -256,7 +279,8 @@
     const p = getActiveParams();
     const active = isEffectivelyActive();
 
-    nodes.compressor.threshold.setTargetAtTime(p.threshold, now, 0.015);
+    const thr = settings.dynamicThreshold ? currentDynThreshold : p.threshold;
+    nodes.compressor.threshold.setTargetAtTime(thr, now, 0.015);
     nodes.compressor.ratio.setTargetAtTime(p.ratio, now, 0.015);
     nodes.compressor.knee.setTargetAtTime(p.knee, now, 0.015);
     nodes.compressor.attack.setTargetAtTime(p.attack, now, 0.015);
@@ -267,53 +291,107 @@
     nodes.dryGain.gain.setTargetAtTime(active ? 0.0 : 1.0, now, 0.015);
   }
 
-  function resetNormalizerState() {
-    trackedPeak = 0.25;
+  function resetDynamicsState() {
+    trackedInRms = 0.1;
+    trackedInPeak = 0.25;
+    trackedSpeechSec = 0;
+    currentDynThreshold = -16;
+
+    trackedNormPeak = 0.25;
     currentNormGain = 1.0;
+
     if (nodes && audioCtx) {
-      nodes.normGain.gain.setTargetAtTime(1.0, audioCtx.currentTime, 0.02);
+      const now = audioCtx.currentTime;
+      nodes.normGain.gain.setTargetAtTime(1.0, now, 0.02);
+      if (settings.dynamicThreshold) {
+        nodes.compressor.threshold.setTargetAtTime(currentDynThreshold, now, 0.02);
+      }
     }
   }
 
-  function startNormalizerLoop() {
-    if (normIntervalId) clearInterval(normIntervalId);
-    lastNormTick = performance.now();
+  function startDspLoop() {
+    if (dspIntervalId) clearInterval(dspIntervalId);
+    lastLoopTick = performance.now();
 
-    normIntervalId = setInterval(() => {
+    dspIntervalId = setInterval(() => {
       const nowMs = performance.now();
-      const dt = Math.min((nowMs - lastNormTick) / 1000, 0.25);
-      lastNormTick = nowMs;
+      const dt = Math.min((nowMs - lastLoopTick) / 1000, 0.25);
+      lastLoopTick = nowMs;
 
       if (!nodes || !audioCtx || !hookedVideo) return;
 
       const active = isEffectivelyActive();
       const playing = !hookedVideo.paused && !hookedVideo.ended && !hookedVideo.muted && hookedVideo.volume >= 0.01;
+      const p = getActiveParams();
 
       if (active && playing && audioCtx.state === 'running') {
-        nodes.normAnalyser.getFloatTimeDomainData(analyserBuf);
+        // ---- Stage 1A: Dynamic Threshold (Input RMS + Crest Factor) ----
+        if (settings.dynamicThreshold) {
+          nodes.inAnalyser.getFloatTimeDomainData(inAnalyserBuf);
+
+          let sumSq = 0;
+          let inBlockPeak = 0;
+          for (let i = 0; i < inAnalyserBuf.length; i++) {
+            const s = inAnalyserBuf[i];
+            sumSq += s * s;
+            const a = Math.abs(s);
+            if (a > inBlockPeak) inBlockPeak = a;
+          }
+          const inBlockRms = Math.sqrt(sumSq / inAnalyserBuf.length);
+
+          if (inBlockRms > NOISE_FLOOR_LINEAR) {
+            trackedSpeechSec += dt;
+
+            // Fast lock-on during first 2s of speech, steady 3.5s baseline afterward
+            const rmsTc = trackedSpeechSec < 2.0 ? 0.35 : 3.5;
+            const rmsAlpha = 1 - Math.exp(-dt / rmsTc);
+            trackedInRms += (inBlockRms - trackedInRms) * rmsAlpha;
+
+            if (inBlockPeak > trackedInPeak) {
+              trackedInPeak = inBlockPeak;
+            } else {
+              const peakDecayTc = trackedSpeechSec < 2.0 ? 1.5 : 5.0;
+              trackedInPeak = Math.max(inBlockPeak, trackedInPeak * Math.exp(-dt / peakDecayTc));
+            }
+
+            const inRmsDb = 20 * Math.log10(Math.max(trackedInRms, 0.0001));
+            const inPeakDb = 20 * Math.log10(Math.max(trackedInPeak, 0.0001));
+            const crestDb = Math.max(0, inPeakDb - inRmsDb);
+
+            // Back off threshold on already-compressed videos with low crest factor
+            const relaxTarget = typeof p.relaxCrest === 'number' ? p.relaxCrest : 10;
+            const crestRelax = Math.min(8, Math.max(0, relaxTarget - crestDb));
+
+            const targetThr = Math.max(-60, Math.min(0, inRmsDb + p.headroom + crestRelax));
+            const thrTc = trackedSpeechSec < 2.0 ? 0.25 : 0.8;
+            const thrAlpha = 1 - Math.exp(-dt / thrTc);
+            currentDynThreshold += (targetThr - currentDynThreshold) * thrAlpha;
+
+            nodes.compressor.threshold.setTargetAtTime(currentDynThreshold, audioCtx.currentTime, 0.03);
+          }
+        }
+
+        // ---- Stage 2: Post-Compressor -0.1 dBFS Peak Normalizer ----
+        nodes.normAnalyser.getFloatTimeDomainData(normAnalyserBuf);
 
         let blockPeak = 0;
-        for (let i = 0; i < analyserBuf.length; i++) {
-          const a = Math.abs(analyserBuf[i]);
+        for (let i = 0; i < normAnalyserBuf.length; i++) {
+          const a = Math.abs(normAnalyserBuf[i]);
           if (a > blockPeak) blockPeak = a;
         }
 
-        // Only adapt when signal is above the silence noise gate
         if (blockPeak > NOISE_FLOOR_LINEAR) {
-          if (blockPeak > trackedPeak) {
-            // Instant peak capture so sudden spikes pull gain down cleanly
-            trackedPeak = blockPeak;
+          if (blockPeak > trackedNormPeak) {
+            trackedNormPeak = blockPeak;
           } else {
-            // Gentle 4s peak release so steady quiet speech rises naturally
-            trackedPeak = Math.max(blockPeak, trackedPeak * Math.exp(-dt / 4.0));
+            trackedNormPeak = Math.max(blockPeak, trackedNormPeak * Math.exp(-dt / 4.0));
           }
 
           const desiredGain = Math.min(
             MAX_NORM_GAIN,
-            Math.max(MIN_NORM_GAIN, TARGET_PEAK_LINEAR / Math.max(trackedPeak, 0.001))
+            Math.max(MIN_NORM_GAIN, TARGET_PEAK_LINEAR / Math.max(trackedNormPeak, 0.001))
           );
 
-          // Fast gain reduction (25 ms), smooth gain recovery (600 ms)
           const tc = desiredGain < currentNormGain ? 0.025 : 0.6;
           const alpha = 1 - Math.exp(-dt / tc);
           currentNormGain += (desiredGain - currentNormGain) * alpha;
@@ -324,8 +402,10 @@
 
       // Live meter readout only while sub-menu is visible
       if (ui && ui.panel.classList.contains('open')) {
+        const liveThr = settings.dynamicThreshold ? currentDynThreshold : p.threshold;
         const gr = active ? nodes.compressor.reduction : 0;
         const normDb = active ? 20 * Math.log10(Math.max(currentNormGain, 0.0001)) : 0;
+        ui.meterThr.textContent = `Thr: ${liveThr.toFixed(0)} dB`;
         ui.meterGr.textContent = `GR: ${gr.toFixed(1)} dB`;
         ui.meterNorm.textContent = `Norm: ${normDb >= 0 ? '+' : ''}${normDb.toFixed(1)} dB`;
       }
@@ -346,6 +426,8 @@
   }
 
   function makeSlider(label, min, max, step, formatFn, onInput) {
+    let currentFormat = formatFn;
+    const labelSpan = el('span', { textContent: label });
     const valSpan = el('span', { className: 'yt-ac-slider-val' });
     const input = el('input', {
       type: 'range',
@@ -355,24 +437,28 @@
       step: String(step),
       onInput: (e) => {
         const num = parseFloat(e.target.value);
-        valSpan.textContent = formatFn(num);
+        valSpan.textContent = currentFormat(num);
         onInput(num);
       }
     });
 
     const row = el('div', { className: 'yt-ac-slider-row' }, [
-      el('div', { className: 'yt-ac-slider-label' }, [
-        el('span', { textContent: label }),
-        valSpan
-      ]),
+      el('div', { className: 'yt-ac-slider-label' }, [labelSpan, valSpan]),
       input
     ]);
 
     return {
       row,
+      reconfigure(cfg) {
+        labelSpan.textContent = cfg.label;
+        input.min = String(cfg.min);
+        input.max = String(cfg.max);
+        input.step = String(cfg.step);
+        currentFormat = cfg.formatFn;
+      },
       setValue(v) {
         input.value = String(v);
-        valSpan.textContent = formatFn(v);
+        valSpan.textContent = currentFormat(v);
       }
     };
   }
@@ -397,7 +483,7 @@
     }, [buildIconSvg()]);
 
     // Insert cleanly right next to the Settings gear
-	const settingsBtn = rightControls.querySelector('.ytp-settings-button');
+    const settingsBtn = rightControls.querySelector('.ytp-settings-button');
     if (settingsBtn) settingsBtn.before(btn);
     else rightControls.prepend(btn);
 
@@ -409,7 +495,6 @@
       'aria-checked': 'true',
       onClick: () => {
         if (settings.enabled && settings.autoBypassMusic && musicReason && manualOverrideId !== currentMeta.videoId) {
-          // Clicking toggle while auto-bypassed overrides for this video
           manualOverrideId = currentMeta.videoId;
         } else {
           settings.enabled = !settings.enabled;
@@ -453,12 +538,29 @@
     };
 
     const sliders = {
-      threshold: makeSlider('Threshold', -60, 0, 1, (v) => `${v} dB`, (v) => onCustomChange('threshold', v)),
+      threshold: makeSlider(
+        'Headroom (Auto)',
+        -12,
+        12,
+        1,
+        (v) => `${v >= 0 ? '+' : ''}${v} dB`,
+        (v) => onCustomChange(settings.dynamicThreshold ? 'headroom' : 'threshold', v)
+      ),
       ratio: makeSlider('Ratio', 1, 20, 0.5, (v) => `${v}:1`, (v) => onCustomChange('ratio', v)),
       knee: makeSlider('Knee', 0, 40, 1, (v) => `${v} dB`, (v) => onCustomChange('knee', v)),
       attack: makeSlider('Attack', 1, 200, 1, (v) => `${v} ms`, (v) => onCustomChange('attack', v / 1000)),
       release: makeSlider('Release', 10, 1000, 10, (v) => `${v} ms`, (v) => onCustomChange('release', v / 1000))
     };
+
+    const dynamicThrCheckbox = el('input', {
+      type: 'checkbox',
+      onChange: (e) => {
+        settings.dynamicThreshold = e.target.checked;
+        saveSettings();
+        applyAudioSettings();
+        syncUI();
+      }
+    });
 
     const autoMusicCheckbox = el('input', {
       type: 'checkbox',
@@ -471,9 +573,9 @@
       }
     });
 
+    const meterThr = el('span', { textContent: 'Thr: -16 dB' });
     const meterGr = el('span', { textContent: 'GR: 0.0 dB' });
     const meterNorm = el('span', { textContent: 'Norm: +0.0 dB' });
-    const meterCeiling = el('span', { textContent: 'Peak: -0.1 dB' });
 
     const panel = el('div', {
       id: 'yt-ac-panel',
@@ -493,10 +595,14 @@
         sliders.release.row
       ]),
       el('label', { className: 'yt-ac-option' }, [
+        dynamicThrCheckbox,
+        el('span', { textContent: 'Dynamic threshold (auto-fit)' })
+      ]),
+      el('label', { className: 'yt-ac-option', style: 'border-top:none;padding-top:5px;' }, [
         autoMusicCheckbox,
         el('span', { textContent: 'Auto-disable on Music / VEVO' })
       ]),
-      el('div', { className: 'yt-ac-meter' }, [meterGr, meterNorm, meterCeiling])
+      el('div', { className: 'yt-ac-meter' }, [meterThr, meterGr, meterNorm])
     ]);
 
     // Prevent clicks/keys inside the sub-menu from triggering YouTube hotkeys
@@ -513,7 +619,9 @@
       masterToggle,
       presetButtons,
       sliders,
+      dynamicThrCheckbox,
       autoMusicCheckbox,
+      meterThr,
       meterGr,
       meterNorm
     };
@@ -547,11 +655,31 @@
       b.classList.toggle('selected', settings.preset === key);
     }
 
-    ui.sliders.threshold.setValue(p.threshold);
+    if (settings.dynamicThreshold) {
+      ui.sliders.threshold.reconfigure({
+        label: 'Headroom (Auto)',
+        min: -12,
+        max: 12,
+        step: 1,
+        formatFn: (v) => `${v >= 0 ? '+' : ''}${v} dB`
+      });
+      ui.sliders.threshold.setValue(p.headroom);
+    } else {
+      ui.sliders.threshold.reconfigure({
+        label: 'Threshold',
+        min: -60,
+        max: 0,
+        step: 1,
+        formatFn: (v) => `${v} dB`
+      });
+      ui.sliders.threshold.setValue(p.threshold);
+    }
+
     ui.sliders.ratio.setValue(p.ratio);
     ui.sliders.knee.setValue(p.knee);
     ui.sliders.attack.setValue(Math.round(p.attack * 1000));
     ui.sliders.release.setValue(Math.round(p.release * 1000));
+    ui.dynamicThrCheckbox.checked = settings.dynamicThreshold;
     ui.autoMusicCheckbox.checked = settings.autoBypassMusic;
   }
 
@@ -577,7 +705,7 @@
 
     if (changedVideo) {
       manualOverrideId = null;
-      resetNormalizerState();
+      resetDynamicsState();
     }
 
     applyAudioSettings();
